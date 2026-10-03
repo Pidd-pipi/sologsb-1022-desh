@@ -21,6 +21,8 @@ export interface Chapter {
   title: string;
   summary: string;
   sentences: Sentence[];
+  /** 正文版本号：句文每修订一次递增；增量提交据此做三方合并 */
+  bodyVersion: number;
 }
 
 export interface Annotation {
@@ -36,6 +38,10 @@ export interface Annotation {
   tags: string[];
   conflictState: 'open' | 'resolved';
   conflictResolution?: string;
+  /** 词级锚点在正文修订后的定位状态：ok 已定位；pending 已降级到所属句、待人工确认 */
+  anchorState?: 'ok' | 'pending';
+  /** 降级前锚定的词面文本，便于正文稳定后重新定位 */
+  anchorHint?: string;
   updatedAt: string;
 }
 

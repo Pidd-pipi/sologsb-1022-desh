@@ -12,6 +12,7 @@ import {
   ScrollShadow,
   Select,
   SelectItem,
+  Switch,
   Tab,
   Tabs,
   Textarea,
@@ -52,9 +53,12 @@ import {
   getSentence,
   getTargetLabel,
   kindLabel,
+  migrateDocument,
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
+import { useChapterSync, type ConflictChoiceValue, type ConflictChoices } from '@/lib/use-collab';
+import { ROLE_LABELS, type ConflictDetail, type PendingCommit, type Role } from '@/lib/collab';
 import type {
   Annotation,
   AnnotationKind,
@@ -279,6 +283,9 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
                   {kindLabel(annotation.kind)}
                 </Chip>
                 {annotation.conflictState === 'open' ? <Chip size="sm" color="danger" variant="bordered">争议中</Chip> : null}
+                {annotation.anchorState === 'pending' ? (
+                  <Chip size="sm" color="warning" variant="bordered">待确认</Chip>
+                ) : null}
               </div>
               <h4 className="mt-2 font-semibold text-stone-900">{annotation.title}</h4>
             </div>
@@ -327,6 +334,251 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
   );
 }
 
+function CommitCenter({ sync }: { sync: ReturnType<typeof useChapterSync> }) {
+  const [choicesByCommit, setChoicesByCommit] = useState<Record<string, ConflictChoices>>({});
+  const [resolving, setResolving] = useState(false);
+
+  function choicesFor(commitId: string): ConflictChoices {
+    return choicesByCommit[commitId] ?? {};
+  }
+
+  function setChoice(commitId: string, opIndex: number, value: ConflictChoices[number]) {
+    setChoicesByCommit((current) => ({
+      ...current,
+      [commitId]: { ...(current[commitId] ?? {}), [opIndex]: value }
+    }));
+  }
+
+  async function resolve(commitId: string) {
+    setResolving(true);
+    const result = await sync.resolveConflict(commitId, choicesFor(commitId));
+    setResolving(false);
+    if (result.ok) {
+      setChoicesByCommit((current) => {
+        const next = { ...current };
+        delete next[commitId];
+        return next;
+      });
+    }
+  }
+
+  if (!sync.pending.length) {
+    return (
+      <div className="grid place-items-center rounded-xl border border-dashed border-stone-300 bg-stone-50/70 p-8 text-center">
+        <Check className="h-8 w-8 text-green-600" />
+        <p className="mt-2 text-sm font-medium text-stone-800">没有待处理的提交</p>
+        <p className="mt-1 text-xs text-stone-500">不同目标的修改会自动并入；同一处双方都改才需要主校裁决。</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4 pr-1">
+      <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 p-2">
+        <span className="text-xs text-stone-600">模拟接口故障（写入失败可重试）</span>
+        <Switch
+          size="sm"
+          isSelected={sync.simulateFailure}
+          onValueChange={sync.setSimulateFailure}
+          aria-label="模拟接口故障"
+        />
+      </div>
+      {sync.pending.map((commit) => {
+        const choices = choicesFor(commit.commitId);
+        const isPrincipal = sync.role === 'principal';
+        return (
+          <Card key={commit.commitId} shadow="none" className="border border-stone-200">
+            <CardBody className="gap-3 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="text-sm font-semibold text-stone-900">{commit.label}</div>
+                  <div className="mt-0.5 text-[11px] text-stone-500">
+                    {new Date(commit.createdAt).toLocaleString('zh-CN')} · 基线 v{commit.baseVersion}
+                  </div>
+                </div>
+                <CommitStatusChip status={commit.status} />
+              </div>
+
+              {commit.status === 'pending' ? (
+                <p className="text-xs text-stone-500">正在写入模拟接口…</p>
+              ) : null}
+
+              {commit.status === 'error' ? (
+                <div className="rounded-lg bg-amber-50 p-2 text-xs leading-5 text-amber-800">
+                  {commit.message ?? '写入失败'}。两边原稿均已保留，可重试；重新打开本页也会继续处理。
+                </div>
+              ) : null}
+
+              {commit.status === 'rejected' ? (
+                <div className="rounded-lg bg-red-50 p-2 text-xs leading-5 text-red-800">
+                  {commit.message ?? '越权保存被拒绝'}。仅主校可裁决冲突；可重试，或移除本待办（本地修改仍保留在草稿中）。
+                </div>
+              ) : null}
+
+              {commit.status === 'conflict' ? (
+                <div className="space-y-3">
+                  {isPrincipal ? (
+                    <p className="text-xs text-stone-600">
+                      同一处正文/注释双方都改了。请逐条选择采用哪一版，或合并条文后重新提交。
+                    </p>
+                  ) : (
+                    <div className="rounded-lg bg-red-50 p-2 text-xs leading-5 text-red-800">
+                      冲突仅主校可裁决。当前角色为整理者，本次保存被拒绝；请等待主校处理后重试。
+                    </div>
+                  )}
+                  {commit.conflicts?.map((conflict) => (
+                    <ConflictResolution
+                      key={conflict.opIndex}
+                      conflict={conflict}
+                      choice={choices[conflict.opIndex]?.choice ?? 'ours'}
+                      mergedText={choices[conflict.opIndex]?.mergedText}
+                      disabled={!isPrincipal || resolving}
+                      onChange={(value) => setChoice(commit.commitId, conflict.opIndex, value)}
+                    />
+                  ))}
+                </div>
+              ) : null}
+
+              <div className="flex flex-wrap gap-2">
+                {commit.status === 'conflict' && isPrincipal ? (
+                  <Button size="sm" color="primary" isLoading={resolving} onPress={() => void resolve(commit.commitId)}>
+                    按选择解决并重新提交
+                  </Button>
+                ) : null}
+                {commit.status === 'error' || commit.status === 'rejected' ? (
+                  <Button size="sm" color="primary" variant="flat" isLoading={sync.busy} onPress={() => void sync.retryCommit(commit.commitId)}>
+                    重试
+                  </Button>
+                ) : null}
+                <Button size="sm" variant="light" onPress={() => sync.discardCommit(commit.commitId)}>
+                  移除待办
+                </Button>
+              </div>
+            </CardBody>
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+function CommitStatusChip({ status }: { status: PendingCommit['status'] }) {
+  const map: Record<PendingCommit['status'], { label: string; color: 'default' | 'primary' | 'warning' | 'danger' }> = {
+    pending: { label: '提交中', color: 'primary' },
+    conflict: { label: '冲突待裁决', color: 'danger' },
+    rejected: { label: '越权拒绝', color: 'danger' },
+    error: { label: '写入失败·可重试', color: 'warning' }
+  };
+  const item = map[status];
+  return <Chip size="sm" color={item.color} variant="flat">{item.label}</Chip>;
+}
+
+function ConflictResolution({
+  conflict,
+  choice,
+  mergedText,
+  disabled,
+  onChange
+}: {
+  conflict: ConflictDetail;
+  choice: ConflictChoiceValue;
+  mergedText?: string;
+  disabled: boolean;
+  onChange: (value: ConflictChoices[number]) => void;
+}) {
+  const [text, setText] = useState(mergedText ?? (conflict.ours as string) ?? '');
+  const kindLabelText = conflict.kind === 'body' ? '正文' : conflict.kind === 'annotation-update' ? '注释修改' : '注释删除';
+
+  return (
+    <div className="rounded-lg border border-red-100 bg-red-50/40 p-2">
+      <div className="flex items-center gap-2">
+        <Chip size="sm" color="danger" variant="flat">{kindLabelText}</Chip>
+        <span className="text-[11px] text-stone-500">目标 {conflict.targetId}</span>
+      </div>
+
+      {conflict.kind === 'body' ? (
+        <div className="mt-2 space-y-2 text-xs">
+          <label className="flex items-start gap-2">
+            <input type="radio" checked={choice === 'ours'} disabled={disabled} onChange={() => onChange({ choice: 'ours' })} />
+            <span><b>我方</b>：{conflict.ours as string}</span>
+          </label>
+          <label className="flex items-start gap-2">
+            <input type="radio" checked={choice === 'theirs'} disabled={disabled} onChange={() => onChange({ choice: 'theirs' })} />
+            <span><b>对方</b>：{conflict.theirs as string}</span>
+          </label>
+          <label className="flex items-start gap-2">
+            <input type="radio" checked={choice === 'merged'} disabled={disabled} onChange={() => onChange({ choice: 'merged', mergedText: text })} />
+            <span className="flex-1">
+              <b>合并</b>：
+              <textarea
+                className="mt-1 w-full rounded border border-stone-300 p-1 text-xs"
+                value={text}
+                disabled={disabled || choice !== 'merged'}
+                onChange={(event) => {
+                  setText(event.target.value);
+                  onChange({ choice: 'merged', mergedText: event.target.value });
+                }}
+              />
+            </span>
+          </label>
+        </div>
+      ) : null}
+
+      {conflict.kind === 'annotation-update' ? (
+        <div className="mt-2 space-y-2 text-xs">
+          <AnnotationVersionRow label="底本" value={conflict.base as Annotation} tone="muted" />
+          <AnnotationVersionRow label="我方" value={conflict.ours as Annotation} tone="ours" />
+          <AnnotationVersionRow label="对方" value={conflict.theirs as Annotation} tone="theirs" />
+          <div className="flex flex-wrap gap-3 pt-1">
+            <label className="flex items-center gap-1">
+              <input type="radio" checked={choice === 'ours'} disabled={disabled} onChange={() => onChange({ choice: 'ours' })} />
+              采用我方
+            </label>
+            <label className="flex items-center gap-1">
+              <input type="radio" checked={choice === 'theirs'} disabled={disabled} onChange={() => onChange({ choice: 'theirs' })} />
+              采用对方
+            </label>
+            <label className="flex items-center gap-1">
+              <input type="radio" checked={choice === 'merged'} disabled={disabled} onChange={() => onChange({ choice: 'merged' })} />
+              合并条文
+            </label>
+          </div>
+        </div>
+      ) : null}
+
+      {conflict.kind === 'annotation-delete' ? (
+        <div className="mt-2 space-y-2 text-xs">
+          <AnnotationVersionRow label="对方已修改" value={conflict.theirs as Annotation} tone="theirs" />
+          <div className="flex flex-wrap gap-3 pt-1">
+            <label className="flex items-center gap-1">
+              <input type="radio" checked={choice === 'ours'} disabled={disabled} onChange={() => onChange({ choice: 'ours' })} />
+              坚持删除
+            </label>
+            <label className="flex items-center gap-1">
+              <input type="radio" checked={choice === 'theirs'} disabled={disabled} onChange={() => onChange({ choice: 'theirs' })} />
+              恢复注释
+            </label>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function AnnotationVersionRow({ label, value, tone }: { label: string; value: Annotation; tone: 'muted' | 'ours' | 'theirs' }) {
+  const toneClass = tone === 'ours' ? 'border-blue-200 bg-blue-50/60' : tone === 'theirs' ? 'border-purple-200 bg-purple-50/60' : 'border-stone-200 bg-stone-50';
+  return (
+    <div className={`rounded border p-2 ${toneClass}`}>
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-semibold">{label}</span>
+        <span className="text-stone-500">{value.source}</span>
+      </div>
+      <div className="mt-1 font-medium">{value.title}</div>
+      <div className="mt-1 line-clamp-3 text-stone-600">{value.body}</div>
+    </div>
+  );
+}
+
 export function TextAnnotationWorkbench() {
   const [state, dispatch] = useReducer(editorReducer, initialDocument, createInitialEditorState);
   const [hydrated, setHydrated] = useState(false);
@@ -344,6 +596,7 @@ export function TextAnnotationWorkbench() {
 
   const workspace = state.workspace;
   const document = workspace.document;
+  const sync = useChapterSync(document, dispatch);
   const selectedChapter =
     document.chapters.find((chapter) => chapter.id === workspace.selectedChapterId) ?? document.chapters[0];
   const selectedSentence = getSentence(document, workspace.selectedSentenceId);
@@ -359,13 +612,16 @@ export function TextAnnotationWorkbench() {
   const selectedAnnotation = document.annotations.find((item) => item.id === workspace.selectedAnnotationId) ?? null;
 
   useEffect(() => {
+    let localDocument: TextDocument = initialDocument;
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const stored = JSON.parse(raw) as WorkspaceState;
         if (stored.document?.chapters?.length) {
-          dispatch({ type: 'hydrate', workspace: stored });
-          if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
+          const migrated = migrateDocument(stored.document);
+          localDocument = migrated;
+          dispatch({ type: 'hydrate', workspace: { ...stored, document: migrated } });
+          if (migrated.snapshots[0]) setLeftVersionId(migrated.snapshots[0].id);
         }
       }
     } catch {
@@ -373,6 +629,8 @@ export function TextAnnotationWorkbench() {
     }
     setHydrated(true);
     setOnline(navigator.onLine);
+    sync.initialize(localDocument);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -465,9 +723,8 @@ export function TextAnnotationWorkbench() {
 
   async function persistSnapshot(reason: string) {
     setApiMessage('正在调用模拟保存接口…');
-    await new Promise((resolve) => window.setTimeout(resolve, 380));
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
-    setApiMessage(`${reason}已写入本地，模拟接口返回 200`);
+    const result = await sync.submitChapter(selectedChapter.id);
+    setApiMessage(`${reason}：${result.message}`);
     setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
   }
 
@@ -535,16 +792,20 @@ export function TextAnnotationWorkbench() {
 
   function applySentenceEdit() {
     if (!editingSentenceId || !editingSentenceDraft.trim()) return;
-    let remapped = 0;
+    let result = { relocated: 0, degraded: 0 };
     dispatch({
       type: 'commit',
       label: '修订句子并保持引用稳定',
       mutate: (doc) => {
-        remapped = updateSentenceText(doc, editingSentenceId, editingSentenceDraft.trim(), tokenizeText);
+        result = updateSentenceText(doc, selectedChapter.id, editingSentenceId, editingSentenceDraft.trim(), tokenizeText);
       }
     });
     setEditingSentenceId(null);
-    if (remapped) setApiMessage(`已修订句子；${remapped} 条词级引用自动迁移到所属句`);
+    if (result.degraded) {
+      setApiMessage(`已修订句子；${result.degraded} 条词级引用在正文中找不到原词，已降级到所属句并标记待确认`);
+    } else if (result.relocated) {
+      setApiMessage(`已修订句子；${result.relocated} 条词级引用已按当前版本重新定位`);
+    }
   }
 
   function saveVersion() {
@@ -673,9 +934,25 @@ export function TextAnnotationWorkbench() {
                 <Redo2 className="h-4 w-4" />
               </Button>
             </Tooltip>
-            <Tooltip content="保存到模拟接口 ⌘/Ctrl + S">
-              <Button size="sm" color="primary" startContent={<Save className="h-4 w-4" />} onPress={() => void persistSnapshot('手动保存')}>
-                保存
+            <Select
+              aria-label="当前角色"
+              size="sm"
+              className="w-28"
+              selectedKeys={new Set([sync.role])}
+              onSelectionChange={(keys) => sync.setRole(Array.from(keys)[0] as Role)}
+            >
+              <SelectItem key="principal">{ROLE_LABELS.principal}</SelectItem>
+              <SelectItem key="editor">{ROLE_LABELS.editor}</SelectItem>
+            </Select>
+            <Tooltip content="保存本章增量到模拟接口 ⌘/Ctrl + S">
+              <Button
+                size="sm"
+                color="primary"
+                startContent={<Save className="h-4 w-4" />}
+                isLoading={sync.busy}
+                onPress={() => void persistSnapshot('手动保存')}
+              >
+                保存本章
               </Button>
             </Tooltip>
           </div>
@@ -692,6 +969,14 @@ export function TextAnnotationWorkbench() {
           </span>
         </div>
       </header>
+
+      {sync.newerAvailable ? (
+        <div className="mx-auto flex max-w-[1800px] items-center gap-3 bg-amber-50 px-4 py-2 text-xs text-amber-800 lg:px-6">
+          <Wifi className="h-4 w-4 shrink-0" />
+          <span>检测到协作者已保存新版本。你的修改保留在本地，下次保存时自动并入不同目标；同一处冲突需主校裁决。</span>
+          <Button size="sm" variant="flat" className="ml-auto" onPress={sync.pullServer}>重新载入协同版本</Button>
+        </div>
+      ) : null}
 
       <main className="mx-auto grid max-w-[1800px] grid-cols-1 gap-4 p-4 lg:grid-cols-[270px_minmax(0,1fr)_390px] lg:p-6">
         <aside className="space-y-4 no-print">
@@ -786,7 +1071,10 @@ export function TextAnnotationWorkbench() {
           <Card shadow="sm" className="paper-texture border border-stone-200">
             <CardHeader className="flex-col items-start gap-2 px-6 pb-2 pt-6 sm:flex-row sm:items-end">
               <div>
-                <div className="text-xs uppercase tracking-[0.24em] text-amber-700">Chapter {selectedChapter?.order}</div>
+                <div className="text-xs uppercase tracking-[0.24em] text-amber-700">
+                  Chapter {selectedChapter?.order}
+                  {selectedChapter ? <span className="ml-2 normal-case tracking-normal text-stone-400">正文 v{sync.chapterVersions[selectedChapter.id] ?? selectedChapter.bodyVersion}</span> : null}
+                </div>
                 <h2 className="mt-1 font-serif text-3xl font-bold text-stone-900">{selectedChapter?.title}</h2>
                 <p className="mt-1 text-sm text-stone-500">{selectedChapter?.summary}</p>
               </div>
@@ -1080,6 +1368,12 @@ export function TextAnnotationWorkbench() {
                       </div>
                       <p className="text-[11px] leading-5 text-stone-500">{apiMessage}</p>
                     </div>
+                  </ScrollShadow>
+                </Tab>
+
+                <Tab key="commits" title={`提交 ${sync.pending.length}`}>
+                  <ScrollShadow className="max-h-[calc(100vh-210px)]">
+                    <CommitCenter sync={sync} />
                   </ScrollShadow>
                 </Tab>
               </Tabs>

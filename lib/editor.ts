@@ -6,6 +6,7 @@ import type {
   SearchResult,
   Sentence,
   TextDocument,
+  TextToken,
   WorkspaceState
 } from './types';
 
@@ -48,6 +49,7 @@ function pushHistory(state: EditorState, next: WorkspaceState, label: string): E
 export type EditorAction =
   | { type: 'hydrate'; workspace: WorkspaceState }
   | { type: 'commit'; label: string; mutate: (document: TextDocument) => void }
+  | { type: 'syncDocument'; document: TextDocument; label: string }
   | { type: 'selectChapter'; chapterId: string }
   | { type: 'selectSentence'; chapterId: string; sentenceId: string }
   | { type: 'selectAnnotation'; annotationId: string | null }
@@ -70,6 +72,12 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       action.mutate(next.document);
       next.document.updatedAt = new Date().toISOString();
       next.dirty = true;
+      return pushHistory(state, next, action.label);
+    }
+    case 'syncDocument': {
+      const next = clone(state.workspace);
+      next.document = clone(action.document);
+      next.dirty = false;
       return pushHistory(state, next, action.label);
     }
     case 'selectChapter': {
@@ -153,6 +161,9 @@ export function getTargetLabel(document: TextDocument, annotation: Annotation): 
     }
   }
 
+  if (annotation.anchorState === 'pending') {
+    return `待确认 · 原锚点“${annotation.anchorHint ?? ''}”已降级到所属句`;
+  }
   return '引用目标已迁移到所属句';
 }
 
@@ -262,32 +273,99 @@ export function kindLabel(kind: AnnotationKind) {
   }[kind];
 }
 
+/**
+ * 正文修订后，把词级注释重新定位到当前分词。
+ * 定位顺序：精确 token id → 同词面（取索引最接近者）→ 去空白词面 → 降级到所属句并标记“待确认”。
+ * 返回重新定位与降级的条数。
+ */
+export function relocateWordAnchors(
+  oldTokens: TextToken[],
+  newTokens: TextToken[],
+  annotations: Annotation[],
+  sentenceId: string
+): { relocated: number; degraded: number } {
+  let relocated = 0;
+  let degraded = 0;
+  const oldIndexById = new Map(oldTokens.map((token, index) => [token.id, index]));
+
+  for (const annotation of annotations) {
+    if (annotation.anchorType !== 'word') continue;
+    const oldIndex = oldIndexById.get(annotation.anchorId);
+    if (oldIndex === undefined) continue; // 锚点不在本句（含已降级到句的注释）
+
+    const oldToken = oldTokens[oldIndex];
+    const hint = annotation.anchorHint ?? oldToken.text.trim();
+
+    // 1. 精确 id（确定性分词在正文未变时稳定命中）
+    if (newTokens.some((token) => token.id === annotation.anchorId)) {
+      annotation.anchorState = 'ok';
+      continue;
+    }
+
+    const pickNearest = (candidates: TextToken[]) => {
+      if (!candidates.length) return undefined;
+      return candidates.reduce((best, token) => {
+        const bestDistance = Math.abs(newTokens.indexOf(best) - oldIndex);
+        const tokenDistance = Math.abs(newTokens.indexOf(token) - oldIndex);
+        return tokenDistance < bestDistance ? token : best;
+      });
+    };
+
+    // 2. 同词面精确匹配，取索引最接近者
+    let target = pickNearest(newTokens.filter((token) => token.text === oldToken.text));
+    // 3. 去空白后的词面匹配
+    if (!target && hint) {
+      target = pickNearest(newTokens.filter((token) => token.text.trim() === hint));
+    }
+
+    if (target) {
+      annotation.anchorId = target.id;
+      annotation.anchorState = 'ok';
+      annotation.anchorHint = hint;
+      relocated += 1;
+    } else {
+      // 4. 找不到原词：降级到所属句，标明待确认，正文稳定后可重新定位
+      annotation.anchorType = 'sentence';
+      annotation.anchorId = sentenceId;
+      annotation.anchorState = 'pending';
+      annotation.anchorHint = hint;
+      degraded += 1;
+    }
+  }
+
+  return { relocated, degraded };
+}
+
 export function updateSentenceText(
   document: TextDocument,
+  chapterId: string,
   sentenceId: string,
   text: string,
   tokenize: (value: string, id: string, existing: Sentence['tokens']) => Sentence['tokens']
 ) {
-  let remappedAnnotations = 0;
   for (const chapter of document.chapters) {
+    if (chapter.id !== chapterId) continue;
     const sentence = chapter.sentences.find((item) => item.id === sentenceId);
     if (!sentence) continue;
-    const previousIds = new Set(sentence.tokens.map((token) => token.id));
+    const previousTokens = sentence.tokens;
     sentence.text = text;
-    sentence.tokens = tokenize(text, sentence.id, sentence.tokens);
-    const remainingIds = new Set(sentence.tokens.map((token) => token.id));
-
-    for (const annotation of document.annotations) {
-      if (annotation.anchorType === 'word' && previousIds.has(annotation.anchorId) && !remainingIds.has(annotation.anchorId)) {
-        annotation.anchorId = sentence.id;
-        annotation.anchorType = 'sentence';
-        annotation.title = `${annotation.title}（引用已随修订迁移）`;
-        remappedAnnotations += 1;
-      }
-    }
-    break;
+    sentence.tokens = tokenize(text, sentence.id, previousTokens);
+    chapter.bodyVersion += 1;
+    return relocateWordAnchors(previousTokens, sentence.tokens, document.annotations, sentence.id);
   }
-  return remappedAnnotations;
+  return { relocated: 0, degraded: 0 };
+}
+
+/** 兼容旧存档：补齐正文版本号与锚点状态 */
+export function migrateDocument(document: TextDocument): TextDocument {
+  const next = clone(document);
+  for (const chapter of next.chapters) {
+    if (typeof chapter.bodyVersion !== 'number') chapter.bodyVersion = 1;
+  }
+  for (const annotation of next.annotations) {
+    if (!annotation.anchorState) annotation.anchorState = 'ok';
+  }
+  return next;
 }
 
 export function removeAnnotationReferences(document: TextDocument, removedId: string) {

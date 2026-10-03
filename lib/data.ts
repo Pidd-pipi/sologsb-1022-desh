@@ -10,10 +10,18 @@ import type {
 } from './types';
 
 const FIXED_TIME = '2026-09-25T02:00:00.000Z';
-let tokenSequence = 0;
 
 function canUseSegmenter() {
   return typeof Intl !== 'undefined' && 'Segmenter' in Intl;
+}
+
+/** 稳定的短哈希：同一词面在任意窗口分词都得到相同 id，词级锚点才能跨窗口解析 */
+function hashTokenText(value: string): string {
+  let hash = 5381;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) + hash + value.charCodeAt(index)) >>> 0;
+  }
+  return hash.toString(36);
 }
 
 export function tokenizeText(text: string, sentenceId: string, existing: TextToken[] = []): TextToken[] {
@@ -38,9 +46,8 @@ export function tokenizeText(text: string, sentenceId: string, existing: TextTok
       used.add(matchedIndex);
       return existing[matchedIndex];
     }
-    tokenSequence += 1;
     return {
-      id: `${sentenceId}-token-${index}-${tokenSequence.toString(36)}`,
+      id: `${sentenceId}-token-${index}-${hashTokenText(part)}`,
       text: part
     };
   });
@@ -50,52 +57,34 @@ function sentence(id: string, order: number, text: string): Sentence {
   return { id, order, text, tokens: tokenizeText(text, id) };
 }
 
-const chapters: Chapter[] = [
-  {
-    id: 'chapter-1',
-    order: 1,
-    title: '逍遥游',
-    summary: '大与小、有待与无待的层层对照。',
-    sentences: [
-      sentence('sentence-1-1', 1, '北冥有鱼，其名为鲲。'),
-      sentence('sentence-1-2', 2, '鲲之大，不知其几千里也。'),
-      sentence('sentence-1-3', 3, '化而为鸟，其名为鹏。'),
-      sentence('sentence-1-4', 4, '鹏之背，不知其几千里也；怒而飞，其翼若垂天之云。'),
-      sentence('sentence-1-5', 5, '是鸟也，海运则将徙于南冥。'),
-      sentence('sentence-1-6', 6, '南冥者，天池也。')
-    ]
-  },
-  {
-    id: 'chapter-2',
-    order: 2,
-    title: '齐物论',
-    summary: '齐是非、同彼我，讨论言语与成心的边界。',
-    sentences: [
-      sentence('sentence-2-1', 1, '夫言非吹也，言者有言。'),
-      sentence('sentence-2-2', 2, '其所言者特未定也。'),
-      sentence('sentence-2-3', 3, '果有言邪？其未尝有言邪？'),
-      sentence('sentence-2-4', 4, '其以为异于鷇音，亦有辩乎？'),
-      sentence('sentence-2-5', 5, '其无辩乎？道恶乎隐而有真伪？')
-    ]
-  },
-  {
-    id: 'chapter-3',
-    order: 3,
-    title: '秋水',
-    summary: '河伯与北海若的问答，展开大小、贵贱与时势之辨。',
-    sentences: [
-      sentence('sentence-3-1', 1, '秋水时至，百川灌河。'),
-      sentence('sentence-3-2', 2, '泾流之大，两涘渚崖之间，不辩牛马。'),
-      sentence('sentence-3-3', 3, '于是焉河伯欣然自喜，以天下之美为尽在己。'),
-      sentence('sentence-3-4', 4, '顺流而东行，至于北海，东面而视，不见水端。'),
-      sentence('sentence-3-5', 5, '于是焉河伯始旋其面目，望洋向若而叹。')
-    ]
-  }
-];
-
-function tokenId(chapter: number, sentenceIndex: number, index: number) {
-  return `sentence-${chapter}-${sentenceIndex + 1}-token-${index}`;
+function chapter(id: string, order: number, title: string, summary: string, sentences: Sentence[]): Chapter {
+  return { id, order, title, summary, sentences, bodyVersion: 1 };
 }
+
+const chapters: Chapter[] = [
+  chapter('chapter-1', 1, '逍遥游', '大与小、有待与无待的层层对照。', [
+    sentence('sentence-1-1', 1, '北冥有鱼，其名为鲲。'),
+    sentence('sentence-1-2', 2, '鲲之大，不知其几千里也。'),
+    sentence('sentence-1-3', 3, '化而为鸟，其名为鹏。'),
+    sentence('sentence-1-4', 4, '鹏之背，不知其几千里也；怒而飞，其翼若垂天之云。'),
+    sentence('sentence-1-5', 5, '是鸟也，海运则将徙于南冥。'),
+    sentence('sentence-1-6', 6, '南冥者，天池也。')
+  ]),
+  chapter('chapter-2', 2, '齐物论', '齐是非、同彼我，讨论言语与成心的边界。', [
+    sentence('sentence-2-1', 1, '夫言非吹也，言者有言。'),
+    sentence('sentence-2-2', 2, '其所言者特未定也。'),
+    sentence('sentence-2-3', 3, '果有言邪？其未尝有言邪？'),
+    sentence('sentence-2-4', 4, '其以为异于鷇音，亦有辩乎？'),
+    sentence('sentence-2-5', 5, '其无辩乎？道恶乎隐而有真伪？')
+  ]),
+  chapter('chapter-3', 3, '秋水', '河伯与北海若的问答，展开大小、贵贱与时势之辨。', [
+    sentence('sentence-3-1', 1, '秋水时至，百川灌河。'),
+    sentence('sentence-3-2', 2, '泾流之大，两涘渚崖之间，不辩牛马。'),
+    sentence('sentence-3-3', 3, '于是焉河伯欣然自喜，以天下之美为尽在己。'),
+    sentence('sentence-3-4', 4, '顺流而东行，至于北海，东面而视，不见水端。'),
+    sentence('sentence-3-5', 5, '于是焉河伯始旋其面目，望洋向若而叹。')
+  ])
+];
 
 function findTokenId(sentenceId: string, text: string) {
   const target = chapters.flatMap((chapter) => chapter.sentences).find((item) => item.id === sentenceId);
