@@ -1,6 +1,7 @@
 import type {
   Annotation,
   AnnotationKind,
+  Chapter,
   ConflictGroup,
   EditorState,
   SearchResult,
@@ -48,6 +49,7 @@ function pushHistory(state: EditorState, next: WorkspaceState, label: string): E
 export type EditorAction =
   | { type: 'hydrate'; workspace: WorkspaceState }
   | { type: 'commit'; label: string; mutate: (document: TextDocument) => void }
+  | { type: 'synced'; chapters: Chapter[]; annotations: Annotation[]; label: string; keepDirty?: boolean }
   | { type: 'selectChapter'; chapterId: string }
   | { type: 'selectSentence'; chapterId: string; sentenceId: string }
   | { type: 'selectAnnotation'; annotationId: string | null }
@@ -71,6 +73,15 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       next.document.updatedAt = new Date().toISOString();
       next.dirty = true;
       return pushHistory(state, next, action.label);
+    }
+    case 'synced': {
+      // 服务端合并结果回写：阅读、校勘、导出统一以合并结果为准
+      const next = clone(state.workspace);
+      next.document.chapters = action.chapters;
+      next.document.annotations = action.annotations;
+      next.document.updatedAt = new Date().toISOString();
+      next.dirty = Boolean(action.keepDirty);
+      return { ...state, workspace: next, lastAction: action.label };
     }
     case 'selectChapter': {
       const chapter = state.workspace.document.chapters.find((item) => item.id === action.chapterId);

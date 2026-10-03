@@ -25,6 +25,7 @@ import {
   CircleHelp,
   FileDown,
   FileJson,
+  GitBranch,
   GitCompareArrows,
   Keyboard,
   Link2,
@@ -33,6 +34,7 @@ import {
   Plus,
   Printer,
   Redo2,
+  RefreshCw,
   Save,
   Search,
   Trash2,
@@ -55,13 +57,30 @@ import {
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
+import {
+  DRAFT_KEY_PREFIX,
+  TAB_ID_KEY,
+  applyChapterCommit,
+  computeMerge,
+  draftSignature,
+  getServerInfo,
+  loadPendingCommits,
+  resetServerState,
+  savePendingCommit,
+  type FailureMode
+} from '@/lib/sync';
 import type {
   Annotation,
   AnnotationKind,
   AnchorType,
+  ChapterCommit,
   ConflictGroup,
+  ConflictResolution,
+  MergeConflict,
+  PendingCommit,
   Sentence,
   TextDocument,
+  UserRole,
   ViewMode,
   WorkspaceState
 } from '@/lib/types';
@@ -279,6 +298,7 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
                   {kindLabel(annotation.kind)}
                 </Chip>
                 {annotation.conflictState === 'open' ? <Chip size="sm" color="danger" variant="bordered">争议中</Chip> : null}
+                {annotation.pendingRelocation ? <Chip size="sm" color="warning" variant="bordered">待确认</Chip> : null}
               </div>
               <h4 className="mt-2 font-semibold text-stone-900">{annotation.title}</h4>
             </div>
@@ -312,6 +332,11 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
             {annotation.references.length ? (
               <span className="flex items-center gap-1"><Link2 className="h-3 w-3" />引用 {annotation.references.length} 条</span>
             ) : null}
+            {annotation.pendingRelocation ? (
+              <Button size="sm" variant="flat" color="warning" onPress={() => onUpdate({ pendingRelocation: false })}>
+                确认定位
+              </Button>
+            ) : null}
             <span className="ml-auto flex gap-1">
               <Button isIconOnly size="sm" variant="light" aria-label="编辑注释" onPress={() => setEditing(true)}>
                 <Pencil className="h-3.5 w-3.5" />
@@ -340,9 +365,19 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [role, setRole] = useState<UserRole>('editor');
+  const [baseRevision, setBaseRevision] = useState(1);
+  const [serverRevision, setServerRevision] = useState(1);
+  const [mergeConflicts, setMergeConflicts] = useState<MergeConflict[]>([]);
+  const [pendingCommit, setPendingCommit] = useState<PendingCommit | null>(null);
+  const [failureMode, setFailureMode] = useState<FailureMode>('none');
+  const [syncing, setSyncing] = useState(false);
+  const tabIdRef = useRef('');
+  const workspaceRef = useRef<WorkspaceState | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
+  workspaceRef.current = workspace;
   const document = workspace.document;
   const selectedChapter =
     document.chapters.find((chapter) => chapter.id === workspace.selectedChapterId) ?? document.chapters[0];
@@ -360,13 +395,55 @@ export function TextAnnotationWorkbench() {
 
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      // 每个窗口（标签页）持有独立草稿，模拟两位整理者同时工作
+      let tabId = sessionStorage.getItem(TAB_ID_KEY);
+      if (!tabId) {
+        tabId = `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        sessionStorage.setItem(TAB_ID_KEY, tabId);
+      }
+      tabIdRef.current = tabId;
+
+      let stored: { workspace?: WorkspaceState; baseRevision?: number; role?: UserRole } | null = null;
+      const raw = localStorage.getItem(`${DRAFT_KEY_PREFIX}${tabId}`);
       if (raw) {
-        const stored = JSON.parse(raw) as WorkspaceState;
-        if (stored.document?.chapters?.length) {
-          dispatch({ type: 'hydrate', workspace: stored });
-          if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
+        stored = JSON.parse(raw);
+      } else {
+        // 兼容旧版单草稿存储
+        const legacy = localStorage.getItem(STORAGE_KEY);
+        if (legacy) {
+          const parsed = JSON.parse(legacy) as WorkspaceState;
+          if (parsed?.document?.chapters?.length) stored = { workspace: parsed };
         }
+      }
+
+      const pending = loadPendingCommits();
+      const pendingEntries = Object.entries(pending);
+      if (!stored?.workspace && pendingEntries.length) {
+        // 原窗口已关闭：接管其未完成提交时，一并接管该窗口的草稿，保证两边原稿都还在
+        const [ownerTab] = pendingEntries[0];
+        const ownerRaw = localStorage.getItem(`${DRAFT_KEY_PREFIX}${ownerTab}`);
+        if (ownerRaw) {
+          const ownerStored = JSON.parse(ownerRaw);
+          if (ownerStored?.workspace?.document?.chapters?.length) stored = ownerStored;
+        }
+      }
+
+      if (stored?.workspace?.document?.chapters?.length) {
+        dispatch({ type: 'hydrate', workspace: stored.workspace });
+        if (stored.workspace.document.snapshots[0]) setLeftVersionId(stored.workspace.document.snapshots[0].id);
+        if (stored.baseRevision) setBaseRevision(stored.baseRevision);
+        if (stored.role) setRole(stored.role);
+      }
+
+      const info = getServerInfo();
+      setServerRevision(info.revision);
+      setMergeConflicts(info.pendingConflicts);
+
+      const mine = pending[tabId] ?? pendingEntries[0]?.[1];
+      if (mine) {
+        setPendingCommit(mine);
+        setRightTab('sync');
+        setApiMessage('检测到未完成的提交：两边原稿均已保留，可重试或放弃。');
       }
     } catch {
       setApiMessage('离线草稿损坏，已载入模拟数据');
@@ -376,13 +453,14 @@ export function TextAnnotationWorkbench() {
   }, []);
 
   useEffect(() => {
-    if (!hydrated) return;
+    if (!hydrated || !tabIdRef.current) return;
     const timer = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
+      const payload = { workspace, baseRevision, role };
+      localStorage.setItem(`${DRAFT_KEY_PREFIX}${tabIdRef.current}`, JSON.stringify(payload));
       setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [hydrated, workspace]);
+  }, [hydrated, workspace, baseRevision, role]);
 
   useEffect(() => {
     const handleOnline = () => setOnline(true);
@@ -429,7 +507,7 @@ export function TextAnnotationWorkbench() {
       const modifier = event.metaKey || event.ctrlKey;
       if (modifier && event.key.toLowerCase() === 's') {
         event.preventDefault();
-        void persistSnapshot('快捷键保存');
+        saveChapter();
         return;
       }
       if (modifier && event.key.toLowerCase() === 'z') {
@@ -461,14 +539,156 @@ export function TextAnnotationWorkbench() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [document, moveToNextAnnotation, selectedSentence, workspace.selectedAnnotationId]);
+  }, [document, moveToNextAnnotation, selectedSentence, workspace.selectedAnnotationId, workspace.selectedChapterId, baseRevision, role, syncing, failureMode]);
 
-  async function persistSnapshot(reason: string) {
-    setApiMessage('正在调用模拟保存接口…');
-    await new Promise((resolve) => window.setTimeout(resolve, 380));
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
-    setApiMessage(`${reason}已写入本地，模拟接口返回 200`);
-    setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
+  async function runCommit(payload: ChapterCommit, attempts: number) {
+    const tabId = tabIdRef.current || 'tab-default';
+    const pending: PendingCommit = {
+      payload,
+      draftSignature: draftSignature(payload.draft),
+      attempts,
+      lastError: '',
+      createdAt: new Date().toISOString()
+    };
+    savePendingCommit(tabId, pending);
+    setPendingCommit(pending);
+    setSyncing(true);
+    setApiMessage('正在提交增量变更…');
+    await new Promise((resolve) => window.setTimeout(resolve, 320));
+    try {
+      const result = applyChapterCommit(payload, { failureMode });
+      // 按提交号清理所有窗口的待重试记录（含已关闭窗口留下的）
+      for (const [ownerTab, record] of Object.entries(loadPendingCommits())) {
+        if (record.payload.submissionId === payload.submissionId) savePendingCommit(ownerTab, null);
+      }
+      setPendingCommit(null);
+      setServerRevision(result.revision);
+      setMergeConflicts(result.conflicts);
+      if (result.status === 'rejected') {
+        // 越权或基线失效：服务端未写入，本地草稿保留
+        setApiMessage(result.message);
+      } else {
+        // 提交在途（或失败重试）期间本地可能又有改动：
+        // 以本次提交的草稿为基线，把合并结果与最新草稿再合并一次，未提交改动保留为待提交
+        const latest = workspaceRef.current;
+        let finalChapters = result.chapters;
+        let finalAnnotations = result.annotations;
+        let keepDirty = false;
+        let rebaseNote = '';
+        if (latest && draftSignature({ chapters: latest.document.chapters, annotations: latest.document.annotations }) !== pending.draftSignature) {
+          const rebased = computeMerge(
+            {
+              revision: result.revision,
+              chapters: result.chapters,
+              annotations: result.annotations,
+              conflicts: [],
+              submissions: {},
+              history: []
+            },
+            pending.payload.draft,
+            {
+              submissionId: pending.payload.submissionId,
+              chapterId: pending.payload.chapterId,
+              baseRevision: result.revision,
+              role,
+              draft: { chapters: latest.document.chapters, annotations: latest.document.annotations }
+            },
+            new Date().toISOString()
+          );
+          finalChapters = rebased.chapters;
+          finalAnnotations = rebased.annotations;
+          keepDirty = true;
+          rebaseNote = '；提交期间的本地改动已保留为待提交';
+          if (rebased.conflicts.length) rebaseNote += `，其中 ${rebased.conflicts.length} 处与合并结果冲突，已保留服务端版本`;
+        }
+        dispatch({
+          type: 'synced',
+          chapters: finalChapters,
+          annotations: finalAnnotations,
+          label: result.message,
+          keepDirty
+        });
+        setBaseRevision(result.revision);
+        setApiMessage(`${result.message}${rebaseNote}（服务端 v${result.revision}）`);
+        if (result.conflicts.length) setRightTab('sync');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const next = { ...pending, attempts: attempts + 1, lastError: message };
+      savePendingCommit(tabId, next);
+      setPendingCommit(next);
+      setApiMessage(`写入失败：${message}。两边原稿均已保留，可重试。`);
+      setRightTab('sync');
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  function saveChapter(resolutions?: ConflictResolution[]) {
+    if (syncing) return;
+    const payload: ChapterCommit = {
+      submissionId: `submission-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      chapterId: workspace.selectedChapterId,
+      baseRevision,
+      role,
+      draft: { chapters: clone(document.chapters), annotations: clone(document.annotations) },
+      resolutions
+    };
+    void runCommit(payload, 0);
+  }
+
+  function retryPendingCommit() {
+    if (!pendingCommit || syncing) return;
+    // 同一提交号幂等重放，服务端去重，不会重复产生注释；
+    // 若失败后本地又有改动，合并结果回写时会保留为待提交改动
+    void runCommit(pendingCommit.payload, pendingCommit.attempts);
+  }
+
+  function discardPendingCommit() {
+    if (!pendingCommit) return;
+    if (!window.confirm('放弃这条未完成的提交？本地草稿会保留，但不再自动重试。')) return;
+    for (const [ownerTab, record] of Object.entries(loadPendingCommits())) {
+      if (record.payload.submissionId === pendingCommit.payload.submissionId) savePendingCommit(ownerTab, null);
+    }
+    setPendingCommit(null);
+    setApiMessage('已放弃未完成的提交，本地草稿保留。');
+  }
+
+  function resolveMergeConflict(conflictId: string, choice: ConflictResolution['choice']) {
+    saveChapter([{ conflictId, choice }]);
+  }
+
+  function refreshServerInfo() {
+    const info = getServerInfo();
+    setServerRevision(info.revision);
+    setMergeConflicts(info.pendingConflicts);
+    setApiMessage(
+      info.revision > baseRevision
+        ? `服务端已到 v${info.revision}，本地基线 v${baseRevision}，保存时将按三方合并自动并入。`
+        : `服务端 v${info.revision}，与本地基线一致。`
+    );
+  }
+
+  function loadLatestFromServer() {
+    if (!window.confirm('放弃本地未提交的改动，载入服务端最新版本？')) return;
+    const info = getServerInfo();
+    dispatch({ type: 'synced', chapters: info.chapters, annotations: info.annotations, label: '已载入服务端最新版本' });
+    setBaseRevision(info.revision);
+    setServerRevision(info.revision);
+    setMergeConflicts(info.pendingConflicts);
+    setApiMessage(`已载入服务端 v${info.revision}，本地未提交改动已放弃。`);
+  }
+
+  function handleResetServer() {
+    if (!window.confirm('将模拟服务端重置为初始底本？各窗口需重新保存。')) return;
+    const fresh = resetServerState();
+    savePendingCommit(tabIdRef.current, null);
+    setPendingCommit(null);
+    setServerRevision(fresh.revision);
+    setBaseRevision(fresh.revision);
+    setMergeConflicts([]);
+    dispatch({ type: 'synced', chapters: fresh.chapters, annotations: fresh.annotations, label: '服务端已重置为初始底本' });
+    setApiMessage('模拟服务端已重置为初始底本（v1）。');
   }
 
   function addAnnotation(values: Omit<Annotation, 'id' | 'status' | 'conflictState' | 'updatedAt'>) {
@@ -660,8 +880,18 @@ export function TextAnnotationWorkbench() {
             >
               {online ? '在线' : '离线可用'}
             </Chip>
+            <Select
+              aria-label="当前角色"
+              size="sm"
+              className="w-40"
+              selectedKeys={new Set([role])}
+              onSelectionChange={(keys) => setRole(Array.from(keys)[0] as UserRole)}
+            >
+              <SelectItem key="editor">校理</SelectItem>
+              <SelectItem key="chief">主校</SelectItem>
+            </Select>
             <Chip size="sm" variant="flat" color={workspace.dirty ? 'warning' : 'default'}>
-              {workspace.dirty ? '草稿待同步' : savedAt ? `本地已存 ${savedAt}` : '离线草稿'}
+              {workspace.dirty ? '草稿待提交' : savedAt ? `本地已存 ${savedAt}` : '离线草稿'}
             </Chip>
             <Tooltip content="撤销 ⌘/Ctrl + Z">
               <Button isIconOnly size="sm" variant="flat" aria-label="撤销" isDisabled={!state.past.length} onPress={() => dispatch({ type: 'undo' })}>
@@ -673,9 +903,9 @@ export function TextAnnotationWorkbench() {
                 <Redo2 className="h-4 w-4" />
               </Button>
             </Tooltip>
-            <Tooltip content="保存到模拟接口 ⌘/Ctrl + S">
-              <Button size="sm" color="primary" startContent={<Save className="h-4 w-4" />} onPress={() => void persistSnapshot('手动保存')}>
-                保存
+            <Tooltip content={`提交增量并与服务端合并（基线 v${baseRevision}）⌘/Ctrl + S`}>
+              <Button size="sm" color="primary" isLoading={syncing} startContent={syncing ? undefined : <Save className="h-4 w-4" />} onPress={() => saveChapter()}>
+                {syncing ? '提交中' : '保存'}
               </Button>
             </Tooltip>
           </div>
@@ -774,7 +1004,7 @@ export function TextAnnotationWorkbench() {
           <Card shadow="none" className="border border-dashed border-stone-300 bg-stone-50/70">
             <CardBody className="gap-2 p-4 text-xs text-stone-600">
               <div className="flex items-center gap-2 font-semibold text-stone-800"><Keyboard className="h-4 w-4" />键盘工作流</div>
-              <p><Kbd>⌘/Ctrl S</Kbd> 模拟接口保存</p>
+              <p><Kbd>⌘/Ctrl S</Kbd> 提交增量并与服务端合并</p>
               <p><Kbd>Alt 1/2/3</Kbd> 切换阅读、编辑、校勘版</p>
               <p><Kbd>J / K</Kbd> 在全部注释间移动</p>
               <p>最后操作：{state.lastAction}</p>
@@ -783,6 +1013,21 @@ export function TextAnnotationWorkbench() {
         </aside>
 
         <section className="min-w-0">
+          {pendingCommit ? (
+            <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span className="min-w-0 flex-1">
+                提交 <code className="text-xs">{pendingCommit.payload.submissionId}</code> 未完成（已重试 {pendingCommit.attempts} 次
+                {pendingCommit.lastError ? `：${pendingCommit.lastError}` : ''}）。两边原稿均已保留，可重试。
+              </span>
+              <Button size="sm" color="warning" variant="flat" isLoading={syncing} onPress={retryPendingCommit}>
+                重试提交
+              </Button>
+              <Button size="sm" variant="light" onPress={discardPendingCommit}>
+                放弃
+              </Button>
+            </div>
+          ) : null}
           <Card shadow="sm" className="paper-texture border border-stone-200">
             <CardHeader className="flex-col items-start gap-2 px-6 pb-2 pt-6 sm:flex-row sm:items-end">
               <div>
@@ -1007,6 +1252,129 @@ export function TextAnnotationWorkbench() {
                           <p className="mt-1 text-xs text-green-700">已解决记录仍保留在各注释的来源字段中。</p>
                         </div>
                       ) : null}
+                    </div>
+                  </ScrollShadow>
+                </Tab>
+
+                <Tab key="sync" title={`协同 ${mergeConflicts.length ? `· ${mergeConflicts.length}` : ''}`}>
+                  <ScrollShadow className="max-h-[calc(100vh-210px)]">
+                    <div className="space-y-4 pr-1">
+                      <div className="rounded-xl border border-stone-200 p-3">
+                        <h3 className="flex items-center gap-2 font-semibold text-stone-900">
+                          <GitBranch className="h-4 w-4" />增量提交与合并
+                        </h3>
+                        <p className="mt-1 text-xs leading-5 text-stone-500">
+                          保存时携带所基于的正文版本（基线 v{baseRevision}），只改不同目标自动并入；同一注释两边都改会列为冲突，仅主校可裁定。
+                        </p>
+                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-stone-600">
+                          <div className="rounded-lg bg-stone-50 p-2">
+                            服务端版本 <Chip size="sm" variant="flat" color="primary">v{serverRevision}</Chip>
+                          </div>
+                          <div className="rounded-lg bg-stone-50 p-2">
+                            本地基线 <Chip size="sm" variant="flat" color={baseRevision < serverRevision ? 'warning' : 'default'}>v{baseRevision}</Chip>
+                          </div>
+                        </div>
+                        {baseRevision < serverRevision ? (
+                          <p className="mt-2 rounded-lg bg-amber-50 p-2 text-xs leading-5 text-amber-800">
+                            服务端已有更新的版本，保存时将按三方合并自动并入，不会覆盖另一窗口的改动。
+                          </p>
+                        ) : null}
+                        <Select
+                          className="mt-3"
+                          size="sm"
+                          label="故障注入（演示写入失败与重试）"
+                          selectedKeys={new Set([failureMode])}
+                          onSelectionChange={(keys) => setFailureMode(Array.from(keys)[0] as FailureMode)}
+                        >
+                          <SelectItem key="none">不注入</SelectItem>
+                          <SelectItem key="write">模拟写入失败（未落盘）</SelectItem>
+                          <SelectItem key="lost-response">模拟写入后响应丢失</SelectItem>
+                        </Select>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <Button size="sm" variant="flat" startContent={<RefreshCw className="h-3.5 w-3.5" />} onPress={refreshServerInfo}>
+                            刷新状态
+                          </Button>
+                          <Button size="sm" variant="flat" onPress={loadLatestFromServer}>
+                            载入服务端最新
+                          </Button>
+                          <Button size="sm" variant="light" color="danger" onPress={handleResetServer}>
+                            重置服务端
+                          </Button>
+                        </div>
+                      </div>
+
+                      {pendingCommit ? (
+                        <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs leading-5 text-amber-900">
+                          <b>未完成的提交：</b>{pendingCommit.payload.submissionId}（已重试 {pendingCommit.attempts} 次）
+                          {pendingCommit.lastError ? <p className="mt-1">最近错误：{pendingCommit.lastError}</p> : null}
+                          <div className="mt-2 flex gap-2">
+                            <Button size="sm" color="warning" variant="flat" isLoading={syncing} onPress={retryPendingCommit}>重试提交</Button>
+                            <Button size="sm" variant="light" onPress={discardPendingCommit}>放弃</Button>
+                          </div>
+                        </div>
+                      ) : null}
+
+                      <Divider />
+
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <h3 className="font-semibold text-stone-900">合并冲突</h3>
+                          <Chip size="sm" variant="flat" color={mergeConflicts.length ? 'danger' : 'success'}>
+                            {mergeConflicts.length} 处待裁定
+                          </Chip>
+                        </div>
+                        {role !== 'chief' && mergeConflicts.length ? (
+                          <p className="mt-2 rounded-lg bg-red-50 p-2 text-xs leading-5 text-red-700">
+                            当前为校理角色：可以查看冲突，但提交裁定会被服务端拒绝。请切换到主校角色。
+                          </p>
+                        ) : null}
+                      </div>
+
+                      {mergeConflicts.map((conflict) => (
+                        <Card key={conflict.id} shadow="none" className="border border-red-100">
+                          <CardBody className="gap-3 p-3">
+                            <div className="flex items-center gap-2">
+                              <Chip size="sm" color="danger" variant="flat">
+                                {conflict.target === 'sentence' ? '正文冲突' : '注释冲突'}
+                              </Chip>
+                              <span className="text-xs font-semibold text-stone-800">{conflict.label}</span>
+                            </div>
+                            <div className="grid gap-2 sm:grid-cols-2">
+                              <div className="rounded-lg border border-stone-200 bg-stone-50 p-2">
+                                <div className="text-[11px] font-semibold text-stone-500">服务端 · {conflict.serverSource}</div>
+                                <p className="mt-1 text-xs leading-5 text-stone-700">{conflict.serverBody}</p>
+                              </div>
+                              <div className="rounded-lg border border-amber-200 bg-amber-50 p-2">
+                                <div className="text-[11px] font-semibold text-amber-700">本地 · {conflict.localSource}</div>
+                                <p className="mt-1 text-xs leading-5 text-stone-700">{conflict.localBody}</p>
+                              </div>
+                            </div>
+                            <p className="text-[11px] leading-4 text-stone-400">基线：{conflict.baseBody}</p>
+                            <div className="flex flex-wrap gap-2">
+                              <Button size="sm" variant="flat" onPress={() => resolveMergeConflict(conflict.id, 'server')}>
+                                保留服务端
+                              </Button>
+                              <Button size="sm" color="primary" variant="flat" onPress={() => resolveMergeConflict(conflict.id, 'local')}>
+                                采用本地
+                              </Button>
+                              {conflict.target === 'annotation' && !conflict.localDeleted && !conflict.serverDeleted ? (
+                                <Button size="sm" variant="light" onPress={() => resolveMergeConflict(conflict.id, 'merged')}>
+                                  合并两者
+                                </Button>
+                              ) : null}
+                            </div>
+                          </CardBody>
+                        </Card>
+                      ))}
+                      {!mergeConflicts.length ? (
+                        <div className="grid place-items-center rounded-xl border border-dashed border-green-200 bg-green-50 p-6 text-center">
+                          <Check className="h-7 w-7 text-green-600" />
+                          <p className="mt-2 text-sm font-medium text-green-800">没有待裁定的合并冲突</p>
+                          <p className="mt-1 text-xs text-green-700">两个窗口改不同目标时会自动并入。</p>
+                        </div>
+                      ) : null}
+
+                      <p className="text-[11px] leading-5 text-stone-500">{apiMessage}</p>
                     </div>
                   </ScrollShadow>
                 </Tab>
